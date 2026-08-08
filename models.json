@@ -365,7 +365,7 @@
       "preserve_extended_metadata": false
     },
     "minimax_h3": {
-      "_note": "Minimax H3 video/audio DiT, matched against Abiray's Minimax-H3-nvfp4-INT4-INT8-Convrot reference dumps. Only norms, token_refiner, time_embedder, condition_proj, patch projections, final_layer's norm/video_out/audio_out, and final_layer.adaln_proj.linear specifically stay unquantized -- block-level adaln_proj.linear is NOT blacklisted here so it quantizes normally under int4_tensorwise (matching the reference non-pruned file, where it's INT4 like every other block GEMM). force_int8_layers still routes block-level adaln_proj.linear to plain INT8 under int8_convrot/int4_convrot specifically (see code: force_int8 is skipped for int4_tensorwise targets), since ConvRot's groupsize (256) doesn't divide 2688. final_layer.adaln_proj.linear is blacklisted explicitly (not caught by force_int8_layers, since blacklist is checked first) -- reference dump shows it BF16-untouched in both pruned and non-pruned files. For *_pruned target formats, pruned_extra_blacklist additionally excludes block-level adaln_proj.linear and adaln_t_table, since the pruned architecture replaces that projection with a rank-8 timestep lookup table this converter does not (yet) synthesize -- do not use *_pruned formats on this profile until that reconstruction is implemented.",
+      "_note": "Minimax H3 video/audio DiT, matched against Abiray's Minimax-H3-nvfp4-INT4-INT8-Convrot reference dumps. Only norms, token_refiner, time_embedder, condition_proj, patch projections, final_layer's norm/video_out/audio_out, and final_layer.adaln_proj.linear specifically stay unquantized -- block-level adaln_proj.linear is NOT blacklisted here so it quantizes normally under int4_tensorwise (matching the reference non-pruned file, where it's INT4 like every other block GEMM). force_int8_layers still routes block-level adaln_proj.linear to plain INT8 under int8_convrot/int4_convrot specifically (see code: force_int8 is skipped for int4_tensorwise targets), since ConvRot's groupsize (256) doesn't divide 2688. final_layer.adaln_proj.linear is blacklisted explicitly (not caught by force_int8_layers, since blacklist is checked first) -- reference dump shows it BF16-untouched in both pruned and non-pruned files. For *_pruned target formats, pruned_extra_blacklist additionally excludes block-level adaln_proj.linear and adaln_t_table, since the pruned architecture replaces that projection with a rank-8 timestep lookup table this converter does not (yet) synthesize -- do not use *_pruned formats on this profile until that reconstruction is implemented. keep_fp32 matches the minimax_h3_ref_* reference profiles' precision for rope.inv_freq/video_patch_proj/audio_patch_proj/final_layer.video_out/final_layer.audio_out/adaln_t_table -- these are blacklisted (or added to blacklist under *_pruned via pruned_extra_blacklist) and would otherwise silently fall back to bf16 via blacklisted_dtype()'s default. keep_fp16 intentionally left empty here (unlike the nvfp4 reference profiles) because final_layer.adaln_proj.linear must stay BF16 per the reference dump, and adding keep_fp16 ['adaln_proj.linear'] would incorrectly promote it to fp16 since that substring also matches 'final_layer.adaln_proj.linear'.",
       "blacklist": [
         "norm1",
         "norm2",
@@ -393,7 +393,14 @@
       ],
       "int8_convrot_layers": [],
       "int4_convrot_layers": [],
-      "keep_fp32": [],
+      "keep_fp32": [
+        "rope.inv_freq",
+        "video_patch_proj",
+        "audio_patch_proj",
+        "final_layer.video_out",
+        "final_layer.audio_out",
+        "adaln_t_table"
+      ],
       "keep_fp16": [],
       "nvfp4_group_size": 16,
       "preserve_extended_metadata": true

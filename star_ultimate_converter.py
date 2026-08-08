@@ -437,6 +437,56 @@ def store_quantized_weight(new_sd, original_weight_key, tensors):
         assign_quantized_tensor(new_sd, out_key, tensor)
 
 
+def store_w4a8_quantized_weight(new_sd, original_weight_key, tensors):
+    """
+    Normalizes whatever suffixes comfy-kitchen's AsymW4A8Int8Layout.state_dict_tensors()
+    returns into the exact key names comfy/ops.py's asym_w4a8_int8 loader requires:
+        <key>.weight            (packed weight data, suffix "")
+        <key>.weight_s_rel      (REQUIRED fp8 per-group scale)
+        <key>.weight_s_channel  (optional fp32 per-channel scale)
+        <key>.weight_codebook   (optional Lloyd-Max codebook)
+
+    This exists because comfy-kitchen's actual output suffixes can drift from what
+    mainline ops.py expects (e.g. "_scale" vs "_s_rel"). Rather than silently writing
+    a checkpoint that loads as "asym_w4a8_int8" but is missing its required scale
+    tensor, this fails loudly at conversion time with the real suffixes it saw.
+    """
+    seen_suffixes = list(tensors.keys())
+    mapped = {}
+
+    for suffix, tensor in tensors.items():
+        if not suffix:
+            canonical = ""
+        else:
+            key_norm = suffix.lstrip("._").lower()
+            if key_norm in ("s_rel", "rel", "group_scale", "gscale", "scale"):
+                canonical = "_s_rel"
+            elif key_norm in ("s_channel", "channel_scale", "cscale"):
+                canonical = "_s_channel"
+            elif key_norm in ("codebook", "cb"):
+                canonical = "_codebook"
+            else:
+                canonical = None
+
+        if canonical is None:
+            print(f"⚠️ W4A8: unrecognized tensor suffix '{suffix}' for {original_weight_key}, storing as-is")
+            canonical = suffix if suffix.startswith(("_", ".")) else f"_{suffix}"
+
+        mapped[canonical] = tensor
+
+    if "_s_rel" not in mapped:
+        raise RuntimeError(
+            f"W4A8 quantization for '{original_weight_key}' did not produce a per-group scale tensor. "
+            f"comfy-kitchen's AsymW4A8Int8Layout.state_dict_tensors() returned suffixes: {seen_suffixes}. "
+            f"comfy/ops.py's asym_w4a8_int8 loader requires a 'weight_s_rel' tensor to load this layer. "
+            f"Update comfy-kitchen to a build that emits it, or map the correct suffix above."
+        )
+
+    for canonical, tensor in mapped.items():
+        out_key = original_weight_key if not canonical else original_weight_key + canonical
+        assign_quantized_tensor(new_sd, out_key, tensor)
+
+
 def quantize_w4a8_convrot(weight_f32: torch.Tensor):
     if not W4A8_AVAILABLE:
         raise RuntimeError(
@@ -1187,7 +1237,7 @@ class StarUltimateModelConverter:
                             qdata, params = quantize_w4a8_convrot(v_tensor_ready)
                             tensors = W4A8_LAYOUT.state_dict_tensors(qdata, params)
 
-                            store_quantized_weight(new_sd, k, tensors)
+                            store_w4a8_quantized_weight(new_sd, k, tensors)
 
                             quant_map["layers"][base_k_meta] = {
                                 "format": W4A8_FORMAT_NAME,
