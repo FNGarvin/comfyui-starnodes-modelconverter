@@ -404,7 +404,149 @@ def build_output_path(out_dir, base_name, target_format):
     return os.path.join(out_dir, f"{stem}-{target_format}.safetensors")
 
 
+class LazyStateDict:
+    """A dict-like state-dict view backed by one or more safetensors files, reading
+    each tensor from disk lazily (one at a time, on access) instead of loading the
+    whole checkpoint into RAM up front.
+
+    This is what makes converting large checkpoints possible on memory-constrained
+    hosts: loading the entire file into RAM before any per-tensor decision is
+    made, then upcasting every fp8 tensor to bf16 in a single pass, can drive
+    peak memory to several times the checkpoint's own file size. With this
+    class, only whichever tensor is currently being processed is ever resident.
+
+    Supports the subset of dict behavior the rest of this module needs:
+    __contains__, __getitem__, __setitem__, __delitem__, pop, __iter__, keys,
+    values, items, __len__. Tensors that get overwritten in place -- e.g.
+    dequantize_input() synthesizes combined weight*scale tensors and removes
+    consumed scale/marker keys -- live in a small in-memory overlay, since the
+    backing files themselves are read-only.
+
+    If `key_prefix` is given, only keys starting with it are exposed (with the
+    prefix stripped), which replaces the old pattern of eagerly loading an entire
+    AIO checkpoint just to throw away everything outside
+    "model.diffusion_model.".
+
+    Duplicate keys across shards: the last shard that defines a key wins, matching
+    the previous `sd.update(part)` behavior.
+    """
+
+    def __init__(self, files, key_prefix=None):
+        self._files = list(files)
+        self._prefix = key_prefix or ""
+        self._handles = [safetensors.safe_open(fp, framework="pt") for fp in self._files]
+
+        self._key_to_handle = {}
+        for idx, handle in enumerate(self._handles):
+            for raw_key in handle.keys():
+                if not raw_key.startswith(self._prefix):
+                    continue
+
+                key = raw_key[len(self._prefix):]
+
+                if key in self._key_to_handle:
+                    print(f"⚠️ Duplicate key '{key}' in {os.path.basename(self._files[idx])}, overwriting")
+
+                self._key_to_handle[key] = (idx, raw_key)
+
+        self._overlay = {}
+        self._deleted = set()
+        self._metadata = self._handles[0].metadata() if self._handles else None
+
+    def metadata(self):
+        return self._metadata
+
+    def close(self):
+        for handle in self._handles:
+            exit_fn = getattr(handle, "__exit__", None)
+            if exit_fn is not None:
+                try:
+                    exit_fn(None, None, None)
+                except Exception:
+                    pass
+
+        self._handles = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def __contains__(self, key):
+        return key not in self._deleted and (key in self._overlay or key in self._key_to_handle)
+
+    def __getitem__(self, key):
+        if key in self._deleted:
+            raise KeyError(key)
+
+        if key in self._overlay:
+            return self._overlay[key]
+
+        if key in self._key_to_handle:
+            idx, raw_key = self._key_to_handle[key]
+            return self._handles[idx].get_tensor(raw_key)
+
+        raise KeyError(key)
+
+    def __setitem__(self, key, value):
+        self._overlay[key] = value
+        self._deleted.discard(key)
+
+    def __delitem__(self, key):
+        if key not in self:
+            raise KeyError(key)
+
+        self._overlay.pop(key, None)
+        self._deleted.add(key)
+
+    def pop(self, key, *default):
+        if key in self:
+            value = self[key]
+            del self[key]
+            return value
+
+        if default:
+            return default[0]
+
+        raise KeyError(key)
+
+    def __iter__(self):
+        seen = set()
+
+        for key in self._overlay:
+            if key not in self._deleted:
+                seen.add(key)
+                yield key
+
+        for key in self._key_to_handle:
+            if key not in self._deleted and key not in seen:
+                yield key
+
+    def keys(self):
+        return list(iter(self))
+
+    def values(self):
+        for key in self:
+            yield self[key]
+
+    def items(self):
+        for key in self:
+            yield key, self[key]
+
+    def __len__(self):
+        return sum(1 for _ in self)
+
+
 def load_input(files):
+    if all(fp.endswith(".safetensors") for fp in files):
+        sd = LazyStateDict(files)
+        return sd, sd.metadata()
+
+    # Legacy / non-safetensors input (e.g. a pickled .ckpt VAE): can't be read
+    # lazily, so fall back to the previous eager loading behavior.
+    print("⚠️ Non-safetensors input detected; loading eagerly (streaming load requires .safetensors).")
+
     sd = {}
 
     for i, fp in enumerate(files):
@@ -419,8 +561,11 @@ def load_input(files):
 
         sd.update(part)
 
-    with safetensors.safe_open(files[0], framework="pt") as f:
-        orig_meta = f.metadata()
+    orig_meta = None
+
+    if files[0].endswith(".safetensors"):
+        with safetensors.safe_open(files[0], framework="pt") as f:
+            orig_meta = f.metadata()
 
     return sd, orig_meta
 
@@ -780,37 +925,67 @@ class StarUltimateModelConverter:
 
             ckpt_path = folder_paths.get_full_path("checkpoints", checkpoint)
             base_name = os.path.splitext(os.path.basename(ckpt_path))[0]
-            orig_meta = None
+            files = [ckpt_path]
 
             if ckpt_path.endswith(".safetensors"):
-                with safetensors.safe_open(ckpt_path, framework="pt") as f:
-                    orig_meta = f.metadata()
+                # Stream the checkpoint instead of loading it whole: for AIO mode
+                # this is the entire multi-GB file, and for Checkpoint mode the old
+                # code loaded the *whole* AIO file (unet + CLIP + VAE) just to keep
+                # the unet-prefixed keys and throw the rest away.
+                if mode == "Checkpoint":
+                    print(f"✂️ Extracting diffusion model from AIO checkpoint: {checkpoint}")
 
-            full_sd = comfy.utils.load_torch_file(ckpt_path, safe_load=True)
+                    sd = LazyStateDict(files, key_prefix=AIO_MODEL_PREFIX)
 
-            if mode == "Checkpoint":
-                print(f"✂️ Extracting diffusion model from AIO checkpoint: {checkpoint}")
+                    if len(sd) == 0:
+                        raise ValueError(
+                            f"No '{AIO_MODEL_PREFIX}' keys found in {os.path.basename(ckpt_path)}. "
+                            "Is this an all-in-one checkpoint?"
+                        )
 
-                sd = {
-                    k[len(AIO_MODEL_PREFIX):]: v
-                    for k, v in full_sd.items()
-                    if k.startswith(AIO_MODEL_PREFIX)
-                }
+                    orig_meta = sd.metadata()
+                    input_bytes = sum(v.numel() * v.element_size() for v in sd.values())
+                    output_path = build_output_path(diffusion_models_dir(), base_name, target_format)
 
-                input_bytes = sum(v.numel() * v.element_size() for v in sd.values())
-                output_path = build_output_path(diffusion_models_dir(), base_name, target_format)
-                files = [ckpt_path]
+                else:
+                    print(f"🔄 AIO Mode: Processing entire checkpoint intact: {checkpoint}")
 
-                del full_sd
+                    sd = LazyStateDict(files)
+                    orig_meta = sd.metadata()
+                    input_bytes = os.path.getsize(ckpt_path)
+                    checkpoints_dir = folder_paths.get_folder_paths("checkpoints")[0]
+                    output_path = build_output_path(checkpoints_dir, f"{base_name}_AIO", target_format)
 
             else:
-                print(f"🔄 AIO Mode: Processing entire checkpoint intact: {checkpoint}")
+                # Legacy / non-safetensors checkpoint (e.g. a pickled .ckpt): can't
+                # be read lazily, so fall back to the previous eager loading
+                # behavior.
+                print("⚠️ Non-safetensors checkpoint detected; loading eagerly (streaming load requires .safetensors).")
 
-                sd = full_sd
-                input_bytes = os.path.getsize(ckpt_path)
-                checkpoints_dir = folder_paths.get_folder_paths("checkpoints")[0]
-                output_path = build_output_path(checkpoints_dir, f"{base_name}_AIO", target_format)
-                files = [ckpt_path]
+                orig_meta = None
+                full_sd = comfy.utils.load_torch_file(ckpt_path, safe_load=True)
+
+                if mode == "Checkpoint":
+                    print(f"✂️ Extracting diffusion model from AIO checkpoint: {checkpoint}")
+
+                    sd = {
+                        k[len(AIO_MODEL_PREFIX):]: v
+                        for k, v in full_sd.items()
+                        if k.startswith(AIO_MODEL_PREFIX)
+                    }
+
+                    input_bytes = sum(v.numel() * v.element_size() for v in sd.values())
+                    output_path = build_output_path(diffusion_models_dir(), base_name, target_format)
+
+                    del full_sd
+
+                else:
+                    print(f"🔄 AIO Mode: Processing entire checkpoint intact: {checkpoint}")
+
+                    sd = full_sd
+                    input_bytes = os.path.getsize(ckpt_path)
+                    checkpoints_dir = folder_paths.get_folder_paths("checkpoints")[0]
+                    output_path = build_output_path(checkpoints_dir, f"{base_name}_AIO", target_format)
 
         else:
             files, out_dir, base_name = resolve_input(
@@ -1383,6 +1558,12 @@ class StarUltimateModelConverter:
                     else:
                         new_sd[k] = v
                         counts["kept"] += 1
+
+        # Done reading from the source file(s) -- release the safetensors handles
+        # (matters most on Windows, where a lingering open mmap can block later
+        # operations on the same file).
+        if hasattr(sd, "close"):
+            sd.close()
 
         final_metadata = OrderedDict()
 
