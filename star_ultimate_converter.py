@@ -170,6 +170,28 @@ def blacklisted_dtype(k: str, keep_fp32, keep_fp16) -> torch.dtype:
     return torch.bfloat16
 
 
+def preserve_dtype(v, k=None, keep_fp32=None, keep_fp16=None):
+    """For tensors that are being kept as-is (not quantized further): if the tensor
+    is already native fp8, leave it untouched instead of upcasting to bf16.
+    Upcasting fp8 -> bf16 cannot recover precision the source already discarded, so
+    doing it unconditionally just doubles the storage of every already-fp8 tensor
+    (biases, norms, blacklisted layers, quantization fallbacks, ...) for zero
+    numerical benefit -- this matters a lot for checkpoints that ship natively in
+    fp8 (e.g. some Qwen-Image-Edit merges). Non-fp8 floating tensors still go
+    through the normal blacklisted-dtype policy (or plain bf16 if no key is given).
+    """
+    if not v.dtype.is_floating_point:
+        return v
+
+    if v.dtype in FP8_DTYPES:
+        return v
+
+    if k is not None:
+        return v.to(dtype=blacklisted_dtype(k, keep_fp32 or [], keep_fp16 or []))
+
+    return v.to(torch.bfloat16)
+
+
 def resolve_input(mode, diffusion_model, checkpoint, text_encoder, custom_path, vae="None"):
     """Resolve the target path based on the selected mode."""
 
@@ -587,10 +609,14 @@ def dequantize_input(sd, metadata):
             elif v.dtype == torch.int8:
                 raise ValueError(f"int8 weight '{k}' has no '{k}_scale' tensor, cannot dequantize.")
 
-    for k, v in sd.items():
-        if v.dtype in FP8_DTYPES:
-            sd[k] = v.to(torch.bfloat16)
-
+    # NOTE: there used to be a final "upcast every remaining fp8 tensor to bf16"
+    # pass here. It was removed: by this point any fp8 tensor that still needed
+    # dequantizing (had a matching *_scale companion) has already been converted
+    # above, so anything still fp8 here is either genuinely native fp8 with no
+    # scale to apply, or about to be blacklisted/kept as-is by the caller -- in
+    # both cases bf16 can't recover precision that's already gone, so upcasting
+    # it here only doubled the file size of every such tensor for no benefit.
+    # See preserve_dtype(), used by the caller's keep-as-is branches instead.
     return sd
 
 
@@ -879,7 +905,7 @@ class StarUltimateModelConverter:
 
                     else:
                         if v.dtype.is_floating_point:
-                            new_sd[k] = v.to(dtype=torch.bfloat16)
+                            new_sd[k] = preserve_dtype(v)
                             counts["kept bf16 (VAE/Misc)"] += 1
                         else:
                             new_sd[k] = v
@@ -923,7 +949,7 @@ class StarUltimateModelConverter:
 
                 if any(name in k for name in active_blacklist):
                     if v.dtype.is_floating_point:
-                        new_sd[k] = v.to(dtype=blacklisted_dtype(k, active_keep_fp32, active_keep_fp16))
+                        new_sd[k] = preserve_dtype(v, k, active_keep_fp32, active_keep_fp16)
                         counts["kept bf16/f16/f32"] += 1
                     else:
                         new_sd[k] = v
@@ -961,7 +987,7 @@ class StarUltimateModelConverter:
                             print(f"⚠️ Forced INT8 failed for {k}: {e}")
 
                             if v.dtype.is_floating_point:
-                                new_sd[k] = v.to(dtype=torch.bfloat16)
+                                new_sd[k] = preserve_dtype(v)
                                 counts["kept bf16"] += 1
                             else:
                                 new_sd[k] = v
@@ -1003,7 +1029,7 @@ class StarUltimateModelConverter:
                             print(f"⚠️ OVERRIDE int4_convrot failed for {k}: {e}")
 
                             if v.dtype.is_floating_point:
-                                new_sd[k] = v.to(dtype=torch.bfloat16)
+                                new_sd[k] = preserve_dtype(v)
                                 counts["kept bf16"] += 1
                             else:
                                 new_sd[k] = v
@@ -1046,7 +1072,7 @@ class StarUltimateModelConverter:
                             print(f"⚠️ OVERRIDE int8_convrot failed for {k}: {e}")
 
                             if v.dtype.is_floating_point:
-                                new_sd[k] = v.to(dtype=torch.bfloat16)
+                                new_sd[k] = preserve_dtype(v)
                                 counts["kept bf16"] += 1
                             else:
                                 new_sd[k] = v
@@ -1129,7 +1155,7 @@ class StarUltimateModelConverter:
                             print(f"⚠️ SVDQuant failed for {k}: {e}")
 
                             if v.dtype.is_floating_point:
-                                new_sd[k] = v.to(dtype=torch.bfloat16)
+                                new_sd[k] = preserve_dtype(v)
                                 counts["kept bf16"] += 1
                             else:
                                 new_sd[k] = v
@@ -1144,12 +1170,12 @@ class StarUltimateModelConverter:
                         blk_idx = block_index_from_key(k)
 
                         if "attn.out_proj" in k:
-                            new_sd[k] = v.to(dtype=torch.bfloat16)
+                            new_sd[k] = preserve_dtype(v)
                             counts["kept bf16 (out_proj)"] += 1
                             continue
 
                         if blk_idx in MINIMAX_H3_BOUNDARY_BLOCKS:
-                            new_sd[k] = v.to(dtype=torch.bfloat16)
+                            new_sd[k] = preserve_dtype(v)
                             counts["kept bf16 (boundary block)"] += 1
                             continue
 
@@ -1184,7 +1210,7 @@ class StarUltimateModelConverter:
                             except Exception as e:
                                 print(f"⚠️ NATIVE_MIX qkv_proj failed for {k}: {e}")
 
-                                new_sd[k] = v.to(dtype=torch.bfloat16)
+                                new_sd[k] = preserve_dtype(v)
                                 counts["kept bf16"] += 1
 
                                 if device == "cuda":
@@ -1216,7 +1242,7 @@ class StarUltimateModelConverter:
                             except Exception as e:
                                 print(f"⚠️ NATIVE_MIX mlp failed for {k}: {e}")
 
-                                new_sd[k] = v.to(dtype=torch.bfloat16)
+                                new_sd[k] = preserve_dtype(v)
                                 counts["kept bf16"] += 1
 
                                 if device == "cuda":
@@ -1224,7 +1250,7 @@ class StarUltimateModelConverter:
 
                             continue
 
-                        new_sd[k] = v.to(dtype=torch.bfloat16)
+                        new_sd[k] = preserve_dtype(v)
                         counts["kept bf16 (native_mix other)"] += 1
                         continue
 
@@ -1255,7 +1281,7 @@ class StarUltimateModelConverter:
                             print(f"⚠️ W4A8 ConvRot failed for {k}: {e}")
 
                             if v.dtype.is_floating_point:
-                                new_sd[k] = v.to(dtype=torch.bfloat16)
+                                new_sd[k] = preserve_dtype(v)
                                 counts["w4a8_failed_bf16"] += 1
                             else:
                                 new_sd[k] = v
@@ -1341,7 +1367,7 @@ class StarUltimateModelConverter:
                         print(f"⚠️ Quantization failed for {k}: {e}")
 
                         if v.dtype.is_floating_point:
-                            new_sd[k] = v.to(dtype=torch.bfloat16)
+                            new_sd[k] = preserve_dtype(v)
                             counts["kept bf16"] += 1
                         else:
                             new_sd[k] = v
@@ -1352,7 +1378,7 @@ class StarUltimateModelConverter:
 
                 else:
                     if v.dtype.is_floating_point:
-                        new_sd[k] = v.to(dtype=torch.bfloat16)
+                        new_sd[k] = preserve_dtype(v)
                         counts["kept bf16"] += 1
                     else:
                         new_sd[k] = v
