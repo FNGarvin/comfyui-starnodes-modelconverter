@@ -1,9 +1,11 @@
 import os
 import re
+import sys
 import json
 import time
 import glob
 import math
+import ctypes
 import inspect
 
 import torch
@@ -115,6 +117,74 @@ DTYPE_NAMES = {
     torch.float8_e5m2: "fp8_e5m2",
     torch.int8: "int8",
 }
+
+
+def _make_memory_trimmer():
+    """Best-effort, cross-platform function that asks the OS to reclaim this
+    process's freed-but-retained memory. Never raises -- any failure (wrong
+    platform, missing library, permission issue) falls back to a no-op, so
+    this can never become a new way for a conversion to fail.
+
+    General-purpose C allocators (glibc's arena on Linux, the Windows heap
+    manager) tend to retain freed blocks for possible reuse rather than
+    returning pages to the OS, particularly under many differently-sized
+    allocate/free cycles -- the pattern produced by dequantizing scale-linked
+    fp8 tensors one at a time (see LazyStateDict/dequantize_input). Left
+    unchecked, a process's resident memory can grow well beyond what any
+    single live tensor requires and never come back down, even though
+    nothing is leaked at the Python level. Periodically nudging the OS to
+    reclaim what's actually unused keeps peak memory close to what the
+    conversion genuinely needs.
+    """
+    if sys.platform == "win32":
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            psapi = ctypes.WinDLL("psapi", use_last_error=True)
+            kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+            psapi.EmptyWorkingSet.argtypes = [ctypes.c_void_p]
+            psapi.EmptyWorkingSet.restype = ctypes.c_bool
+            handle = kernel32.GetCurrentProcess()
+
+            def _trim():
+                try:
+                    psapi.EmptyWorkingSet(handle)
+                except Exception:
+                    pass
+
+            return _trim
+        except Exception:
+            pass
+
+    elif sys.platform.startswith("linux"):
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim.argtypes = [ctypes.c_size_t]
+            libc.malloc_trim.restype = ctypes.c_int
+
+            def _trim():
+                try:
+                    libc.malloc_trim(0)
+                except Exception:
+                    pass
+
+            return _trim
+        except Exception:
+            pass
+
+    def _noop():
+        pass
+
+    return _noop
+
+
+trim_process_memory = _make_memory_trimmer()
+
+# Call trim_process_memory() roughly this often (in tensors processed) during
+# the main conversion loop. Frequent enough to keep peak RSS down on
+# scale-heavy fp8 checkpoints; infrequent enough that the trim call's own
+# (small, OS-level) overhead stays negligible against real per-tensor
+# GPU/CPU quantization work.
+MEMORY_TRIM_INTERVAL = 50
 
 
 def detect_input_format(sd, metadata):
@@ -422,6 +492,16 @@ class LazyStateDict:
     consumed scale/marker keys -- live in a small in-memory overlay, since the
     backing files themselves are read-only.
 
+    Scale-linked dequantization (a fp8/int8 weight combined with its `_scale`
+    companion into a bf16 tensor) is deferred rather than eager: set_scale_pending()
+    just records the tiny scale tensor, and the actual `raw.float() * scale.float()
+    -> bf16` multiply happens the first time the key is read. This matters for
+    checkpoints that are mostly *properly-scaled* fp8 (as opposed to bare native
+    fp8 with nothing to dequantize) -- computing all of them eagerly, before the
+    conversion loop starts consuming them one at a time, would materialize the
+    *entire* dequantized (bf16, so ~2x the fp8 source) checkpoint in RAM at once,
+    reintroducing the same shape of peak-memory problem this class exists to avoid.
+
     If `key_prefix` is given, only keys starting with it are exposed (with the
     prefix stripped), which replaces the old pattern of eagerly loading an entire
     AIO checkpoint just to throw away everything outside
@@ -451,10 +531,24 @@ class LazyStateDict:
 
         self._overlay = {}
         self._deleted = set()
+        self._pending_scale = {}
         self._metadata = self._handles[0].metadata() if self._handles else None
 
     def metadata(self):
         return self._metadata
+
+    def set_scale_pending(self, key, scale):
+        """Record that `key`'s value is its raw backing tensor times `scale`,
+        upcast to bf16 -- computed lazily the next time `key` is read, not here.
+        `key` must currently resolve to a real (not deleted) entry."""
+        if key not in self:
+            raise KeyError(key)
+
+        self._pending_scale[key] = scale
+
+    def _read_backing(self, key):
+        idx, raw_key = self._key_to_handle[key]
+        return self._handles[idx].get_tensor(raw_key)
 
     def close(self):
         for handle in self._handles:
@@ -483,14 +577,19 @@ class LazyStateDict:
         if key in self._overlay:
             return self._overlay[key]
 
+        if key in self._pending_scale:
+            raw = self._read_backing(key)
+            scale = self._pending_scale[key]
+            return (raw.to(torch.float32) * scale.to(torch.float32)).to(torch.bfloat16)
+
         if key in self._key_to_handle:
-            idx, raw_key = self._key_to_handle[key]
-            return self._handles[idx].get_tensor(raw_key)
+            return self._read_backing(key)
 
         raise KeyError(key)
 
     def __setitem__(self, key, value):
         self._overlay[key] = value
+        self._pending_scale.pop(key, None)
         self._deleted.discard(key)
 
     def __delitem__(self, key):
@@ -498,6 +597,7 @@ class LazyStateDict:
             raise KeyError(key)
 
         self._overlay.pop(key, None)
+        self._pending_scale.pop(key, None)
         self._deleted.add(key)
 
     def pop(self, key, *default):
@@ -727,6 +827,20 @@ def dequantize_input(sd, metadata):
                 "Use a higher precision source model."
             )
 
+    # Combining a raw weight with its scale into a dequantized bf16 tensor is
+    # deferred (via set_scale_pending) rather than computed here, when the state
+    # dict supports it (LazyStateDict does; the legacy eager-dict fallback from
+    # load_input()/the AIO block does not, since it's already fully materialized
+    # anyway). Doing this eagerly for every scale-linked tensor in one pass -- as
+    # opposed to one at a time, when the conversion loop actually consumes each
+    # key -- would materialize the *entire* dequantized checkpoint in RAM at once
+    # for a checkpoint that's mostly properly-scaled fp8, which is exactly the
+    # kind of peak-memory blowup this module's streaming design exists to avoid.
+    set_pending = getattr(sd, "set_scale_pending", None)
+
+    def _dequantize_now(key, scale):
+        sd[key] = (sd[key].to(torch.float32) * scale.to(torch.float32)).to(torch.bfloat16)
+
     if "scaled_fp8" in sd:
         sd.pop("scaled_fp8")
 
@@ -735,7 +849,10 @@ def dequantize_input(sd, metadata):
             wk = k[: -len(".scale_weight")] + ".weight"
 
             if wk in sd:
-                sd[wk] = (sd[wk].to(torch.float32) * scale.to(torch.float32)).to(torch.bfloat16)
+                if set_pending is not None:
+                    set_pending(wk, scale)
+                else:
+                    _dequantize_now(wk, scale)
 
         for k in [k for k in sd if k.endswith(".scale_input")]:
             sd.pop(k)
@@ -750,18 +867,19 @@ def dequantize_input(sd, metadata):
             scale = sd.pop(k + "_scale", None)
 
             if scale is not None:
-                sd[k] = (v.to(torch.float32) * scale.to(torch.float32)).to(torch.bfloat16)
+                if set_pending is not None:
+                    set_pending(k, scale)
+                else:
+                    _dequantize_now(k, scale)
             elif v.dtype == torch.int8:
                 raise ValueError(f"int8 weight '{k}' has no '{k}_scale' tensor, cannot dequantize.")
 
-    # NOTE: there used to be a final "upcast every remaining fp8 tensor to bf16"
-    # pass here. It was removed: by this point any fp8 tensor that still needed
-    # dequantizing (had a matching *_scale companion) has already been converted
-    # above, so anything still fp8 here is either genuinely native fp8 with no
-    # scale to apply, or about to be blacklisted/kept as-is by the caller -- in
-    # both cases bf16 can't recover precision that's already gone, so upcasting
-    # it here only doubled the file size of every such tensor for no benefit.
-    # See preserve_dtype(), used by the caller's keep-as-is branches instead.
+    # Any fp8 tensor still present at this point either had a matching *_scale
+    # companion and was already converted above, or is genuinely native fp8 with
+    # nothing to dequantize and will be blacklisted or kept as-is by the caller.
+    # In neither case does upcasting it to bf16 recover any precision -- it would
+    # only double the storage of every such tensor for no benefit. See
+    # preserve_dtype(), used by the caller's keep-as-is branches instead.
     return sd
 
 
@@ -1034,6 +1152,9 @@ class StarUltimateModelConverter:
             for i, (k, v) in enumerate(sd.items()):
                 pbar.update_absolute(i + 1)
 
+                if (i + 1) % MEMORY_TRIM_INTERVAL == 0:
+                    trim_process_memory()
+
                 if v.dtype.is_floating_point:
                     new_sd[k] = v.to(target_dtype)
                     counts[target_format] += 1
@@ -1044,6 +1165,9 @@ class StarUltimateModelConverter:
         else:
             for i, (k, v) in enumerate(sd.items()):
                 pbar.update_absolute(i + 1)
+
+                if (i + 1) % MEMORY_TRIM_INTERVAL == 0:
+                    trim_process_memory()
 
                 if mode == "AIO":
                     if k.startswith(AIO_MODEL_PREFIX):
