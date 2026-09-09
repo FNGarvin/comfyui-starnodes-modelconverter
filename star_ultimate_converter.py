@@ -119,11 +119,11 @@ DTYPE_NAMES = {
 }
 
 
-def _make_memory_trimmer():
+def _make_cpu_memory_trimmer():
     """Best-effort, cross-platform function that asks the OS to reclaim this
-    process's freed-but-retained memory. Never raises -- any failure (wrong
-    platform, missing library, permission issue) falls back to a no-op, so
-    this can never become a new way for a conversion to fail.
+    process's freed-but-retained CPU memory. Never raises -- any failure
+    (wrong platform, missing library, permission issue) falls back to a
+    no-op, so this can never become a new way for a conversion to fail.
 
     General-purpose C allocators (glibc's arena on Linux, the Windows heap
     manager) tend to retain freed blocks for possible reuse rather than
@@ -175,6 +175,32 @@ def _make_memory_trimmer():
         pass
 
     return _noop
+
+
+def _make_memory_trimmer():
+    """Combines the CPU trimmer above with PyTorch's own torch.cuda.empty_cache().
+
+    CUDA's caching allocator can exhibit the same retention pattern as the
+    OS heap above, just on GPU memory: many sequential, differently-sized
+    quantization allocations can accumulate reserved memory that's never
+    returned to the driver, which is more pronounced for formats whose
+    quantization path allocates a wider variety of tensor shapes and sizes
+    per layer (e.g. block-scaled formats like NVFP4, compared to a uniform
+    per-tensor scale like fp8). Unlike the CPU case, PyTorch already exposes
+    the fix as a first-class, always-safe API, so no platform-specific code
+    is needed here.
+    """
+    cpu_trim = _make_cpu_memory_trimmer()
+
+    def _trim():
+        cpu_trim()
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    return _trim
 
 
 trim_process_memory = _make_memory_trimmer()
@@ -969,6 +995,7 @@ class StarUltimateModelConverter:
     CATEGORY = "⭐StarNodes/Model Tools"
     OUTPUT_NODE = True
 
+    @torch.no_grad()
     def convert(
         self,
         mode,
@@ -983,6 +1010,8 @@ class StarUltimateModelConverter:
         svdquant_rank=64,
         svdquant_refine_iters=10,
     ):
+        # This is pure weight transformation, never training, so gradient
+        # tracking should never be active here.
         configs = load_model_configs()
 
         (
@@ -1662,6 +1691,9 @@ class StarUltimateModelConverter:
                         quant_map["layers"][base_k_meta] = layer_conf
                         counts[target_format] += 1
 
+                        if device == "cuda":
+                            del v_tensor, v_tensor_ready
+
                     except Exception as e:
                         print(f"⚠️ Quantization failed for {k}: {e}")
 
@@ -1672,8 +1704,8 @@ class StarUltimateModelConverter:
                             new_sd[k] = v
                             counts["kept"] += 1
 
-                    if device == "cuda":
-                        del v_tensor
+                        if device == "cuda":
+                            del v_tensor
 
                 else:
                     if v.dtype.is_floating_point:
