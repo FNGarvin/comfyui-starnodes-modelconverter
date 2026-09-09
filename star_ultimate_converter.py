@@ -275,6 +275,17 @@ def preserve_dtype(v, k=None, keep_fp32=None, keep_fp16=None):
     numerical benefit -- this matters a lot for checkpoints that ship natively in
     fp8 (e.g. some Qwen-Image-Edit merges). Non-fp8 floating tensors still go
     through the normal blacklisted-dtype policy (or plain bf16 if no key is given).
+
+    Quantization metadata tensors (any key whose last "."-segment contains
+    "scale" -- weight_scale, input_scale, pre_quant_scale, scale_weight, ...)
+    are never downcast either, regardless of dtype: these aren't weight data,
+    they're the scale a *different* tensor needs to be interpreted correctly.
+    A source model's own "input_scale" (a per-layer activation-quantization
+    scale) rides through this converter untouched whenever its paired weight
+    gets re-quantized to a different format, and it's still expected downstream
+    at full precision -- downcasting it to bf16 doesn't just lose precision,
+    it can hard-fail ComfyUI's fp8 inference path outright (it requires a
+    float32 scale) even though this converter never wrote that tensor itself.
     """
     if not v.dtype.is_floating_point:
         return v
@@ -283,6 +294,8 @@ def preserve_dtype(v, k=None, keep_fp32=None, keep_fp16=None):
         return v
 
     if k is not None:
+        if "scale" in k.rsplit(".", 1)[-1].lower():
+            return v
         return v.to(dtype=blacklisted_dtype(k, keep_fp32 or [], keep_fp16 or []))
 
     return v.to(torch.bfloat16)
@@ -1233,7 +1246,7 @@ class StarUltimateModelConverter:
 
                     else:
                         if v.dtype.is_floating_point:
-                            new_sd[k] = preserve_dtype(v)
+                            new_sd[k] = preserve_dtype(v, k)
                             counts["kept bf16 (VAE/Misc)"] += 1
                         else:
                             new_sd[k] = v
@@ -1315,7 +1328,7 @@ class StarUltimateModelConverter:
                             print(f"⚠️ Forced INT8 failed for {k}: {e}")
 
                             if v.dtype.is_floating_point:
-                                new_sd[k] = preserve_dtype(v)
+                                new_sd[k] = preserve_dtype(v, k)
                                 counts["kept bf16"] += 1
                             else:
                                 new_sd[k] = v
@@ -1357,7 +1370,7 @@ class StarUltimateModelConverter:
                             print(f"⚠️ OVERRIDE int4_convrot failed for {k}: {e}")
 
                             if v.dtype.is_floating_point:
-                                new_sd[k] = preserve_dtype(v)
+                                new_sd[k] = preserve_dtype(v, k)
                                 counts["kept bf16"] += 1
                             else:
                                 new_sd[k] = v
@@ -1400,7 +1413,7 @@ class StarUltimateModelConverter:
                             print(f"⚠️ OVERRIDE int8_convrot failed for {k}: {e}")
 
                             if v.dtype.is_floating_point:
-                                new_sd[k] = preserve_dtype(v)
+                                new_sd[k] = preserve_dtype(v, k)
                                 counts["kept bf16"] += 1
                             else:
                                 new_sd[k] = v
@@ -1418,7 +1431,14 @@ class StarUltimateModelConverter:
                         weight_quantized = ck.quantize_per_tensor_fp8(v_tensor, weight_scale)
 
                         new_sd[k] = weight_quantized.cpu()
-                        new_sd[f"{base_k_file}.weight_scale"] = weight_scale.to(torch.bfloat16).cpu()
+                        # Keep the scale in float32: ComfyUI's fp8 inference path (at
+                        # least for Flux) hard-requires a float32 scale when it
+                        # re-quantizes activations against this weight, and even where
+                        # it doesn't hard-fail, a bf16 scale (~3 significant decimal
+                        # digits) gets multiplied into every element of the tensor on
+                        # dequantization, so downcasting it saves 2 bytes on one scalar
+                        # at the cost of real precision loss across the whole layer.
+                        new_sd[f"{base_k_file}.weight_scale"] = weight_scale.cpu()
 
                         quant_map["layers"][base_k_meta] = {"format": "float8_e4m3fn"}
                         counts["fp8"] += 1
@@ -1483,7 +1503,7 @@ class StarUltimateModelConverter:
                             print(f"⚠️ SVDQuant failed for {k}: {e}")
 
                             if v.dtype.is_floating_point:
-                                new_sd[k] = preserve_dtype(v)
+                                new_sd[k] = preserve_dtype(v, k)
                                 counts["kept bf16"] += 1
                             else:
                                 new_sd[k] = v
@@ -1498,12 +1518,12 @@ class StarUltimateModelConverter:
                         blk_idx = block_index_from_key(k)
 
                         if "attn.out_proj" in k:
-                            new_sd[k] = preserve_dtype(v)
+                            new_sd[k] = preserve_dtype(v, k)
                             counts["kept bf16 (out_proj)"] += 1
                             continue
 
                         if blk_idx in MINIMAX_H3_BOUNDARY_BLOCKS:
-                            new_sd[k] = preserve_dtype(v)
+                            new_sd[k] = preserve_dtype(v, k)
                             counts["kept bf16 (boundary block)"] += 1
                             continue
 
@@ -1538,7 +1558,7 @@ class StarUltimateModelConverter:
                             except Exception as e:
                                 print(f"⚠️ NATIVE_MIX qkv_proj failed for {k}: {e}")
 
-                                new_sd[k] = preserve_dtype(v)
+                                new_sd[k] = preserve_dtype(v, k)
                                 counts["kept bf16"] += 1
 
                                 if device == "cuda":
@@ -1570,7 +1590,7 @@ class StarUltimateModelConverter:
                             except Exception as e:
                                 print(f"⚠️ NATIVE_MIX mlp failed for {k}: {e}")
 
-                                new_sd[k] = preserve_dtype(v)
+                                new_sd[k] = preserve_dtype(v, k)
                                 counts["kept bf16"] += 1
 
                                 if device == "cuda":
@@ -1578,7 +1598,7 @@ class StarUltimateModelConverter:
 
                             continue
 
-                        new_sd[k] = preserve_dtype(v)
+                        new_sd[k] = preserve_dtype(v, k)
                         counts["kept bf16 (native_mix other)"] += 1
                         continue
 
@@ -1609,7 +1629,7 @@ class StarUltimateModelConverter:
                             print(f"⚠️ W4A8 ConvRot failed for {k}: {e}")
 
                             if v.dtype.is_floating_point:
-                                new_sd[k] = preserve_dtype(v)
+                                new_sd[k] = preserve_dtype(v, k)
                                 counts["w4a8_failed_bf16"] += 1
                             else:
                                 new_sd[k] = v
@@ -1674,7 +1694,11 @@ class StarUltimateModelConverter:
                         store_quantized_weight(new_sd, k, tensors)
 
                         if pre_quant_scale is not None:
-                            new_sd[f"{base_k_file}.pre_quant_scale"] = pre_quant_scale.to(torch.bfloat16).cpu()
+                            # Keep float32 for the same reason as weight_scale above:
+                            # this gets applied against activations at inference time,
+                            # and a bf16 per-channel scale risks both precision loss and
+                            # backend dtype-compatibility failures.
+                            new_sd[f"{base_k_file}.pre_quant_scale"] = pre_quant_scale.cpu()
 
                         layer_conf = {"format": fmt_name}
 
@@ -1698,7 +1722,7 @@ class StarUltimateModelConverter:
                         print(f"⚠️ Quantization failed for {k}: {e}")
 
                         if v.dtype.is_floating_point:
-                            new_sd[k] = preserve_dtype(v)
+                            new_sd[k] = preserve_dtype(v, k)
                             counts["kept bf16"] += 1
                         else:
                             new_sd[k] = v
@@ -1709,7 +1733,7 @@ class StarUltimateModelConverter:
 
                 else:
                     if v.dtype.is_floating_point:
-                        new_sd[k] = preserve_dtype(v)
+                        new_sd[k] = preserve_dtype(v, k)
                         counts["kept bf16"] += 1
                     else:
                         new_sd[k] = v
